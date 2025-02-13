@@ -1,0 +1,13 @@
+{
+  "api_config": {
+    "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+    "key": "sk-your-key-here",
+    "provider": "custom"
+  },
+  "ocr_settings": {
+    "dpi": 300
+  },
+  "poppler_config": {
+    "path": "/opt/homebrew/Cellar/poppler/25.01.0/bin"
+  }
+}
