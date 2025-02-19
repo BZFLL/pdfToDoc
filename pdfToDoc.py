@@ -390,6 +390,8 @@ class ImageProcessorApp:
                 
                 # 调用翻译函数获取译文
                 if original_text:
+                    # 为避免429错误，在发起翻译请求前等待10秒
+                    time.sleep(10)
                     self.update_status(f"图片 {index}/{total_images}: 正在翻译...", 60 + index/total_images*10)
                     logging.info(f"图片 {index}/{total_images}: 开始翻译 {filename}")
                     translated_text = translate_text(original_text, self.language_var.get())
