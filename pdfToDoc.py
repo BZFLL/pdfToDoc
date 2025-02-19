@@ -19,6 +19,7 @@ from docx.shared import Inches
 from docx.oxml.ns import nsdecls
 from docx.oxml import parse_xml
 import shutil
+import queue
 
 # 配置日志
 logging.basicConfig(
@@ -27,12 +28,12 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# API配置（请修改config.json进行设置）
+# 从配置文件中读取API设置
 with open('config.json') as f:
     config = json.load(f)
 API_ENDPOINT = config['api_config']['endpoint']
 AI_API_KEY = config['api_config']['key']
-REQUEST_TIMEOUT = 30  # API请求超时时间
+REQUEST_TIMEOUT = 30    # API请求超时时间
 
 class APIRateLimiter:
     """API速率限制器"""
@@ -49,19 +50,15 @@ class APIRateLimiter:
 def ocr_text(image_path):
     """使用PaddleOCR进行文字识别（不进行方向识别）"""
     try:
-        # 初始化OCR引擎（单例模式）
         if not hasattr(ocr_text, "ocr_engine"):
             ocr_text.ocr_engine = PaddleOCR(
-                lang='en',         # 使用英文模型
-                use_gpu=False,     # 不使用GPU（根据需要调整）
-                total_process=4    # 并行处理的进程数
-                # 此处不设置 use_angle_cls 参数，默认为关闭方向识别
+                lang='en',
+                use_gpu=False,
+                total_process=4
             )
-        # 调用OCR识别，关闭方向识别（cls=False）
         result = ocr_text.ocr_engine.ocr(image_path, cls=False)
         if not result:
             return ""
-        # 提取所有组内的文本
         recognized_text = "\n".join([line[1][0] for group in result for line in group])
         return recognized_text
     except Exception as e:
@@ -69,23 +66,48 @@ def ocr_text(image_path):
         logging.error(f"OCR识别失败: {str(e)}")
         return None
 
+def split_text_into_chunks(text, max_length=1000):
+    sentences = re.split(r'(?<=[。.!?])', text)
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) > max_length:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                chunks.append(sentence.strip())
+                current_chunk = ""
+        else:
+            current_chunk += sentence
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
 def translate_text(text, target_language):
     try:
         max_retries = 3
-        timeout = 60  # 延长超时时间为60秒
+        timeout = 60
         url = API_ENDPOINT
         headers = {
             "Authorization": f"Bearer {AI_API_KEY}",
             "Content-Type": "application/json",
             "accept": "application/json"
         }
-
         payload = {
             "model": "deepseek-ai/DeepSeek-V3",
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一个中英文翻译专家，将用户输入的中文翻译成英文，或将用户输入的英文翻译成中文。对于非中文内容，它将提供中文翻译结果。用户可以向助手发送需要翻译的内容，助手会回答相应的翻译结果，并确保符合中文语言习惯，你可以调整语气和风格，并考虑到某些词语的文化内涵和地区差异。同时作为翻译家，需将原文翻译成具有信达雅标准的译文。\"信\" 即忠实于原文的内容与意图；\"达\" 意味着译文应通顺易懂，表达清晰；\"雅\" 则追求译文的文化审美和语言的优美。目标是创作出既忠于原作精神，又符合目标语言文化和读者审美的翻译。"
+                    "content": ("你是一个中英文翻译专家，将用户输入的中文翻译成英文，"
+                                "或将用户输入的英文翻译成中文。对于非中文内容，它将提供中文翻译结果。"
+                                "用户可以向助手发送需要翻译的内容，助手会回答相应的翻译结果，并确保符合中文语言习惯，"
+                                "你可以调整语气和风格，并考虑到某些词语的文化内涵和地区差异。"
+                                "同时作为翻译家，需将原文翻译成具有信达雅标准的译文。"
+                                "\"信\" 即忠实于原文的内容与意图；"
+                                "\"达\" 意味着译文应通顺易懂，表达清晰；"
+                                "\"雅\" 则追求译文的文化审美和语言的优美。"
+                                "目标是创作出既忠于原作精神，又符合目标语言文化和读者审美的翻译。")
                 },
                 {
                     "role": "user",
@@ -100,7 +122,6 @@ def translate_text(text, target_language):
             "frequency_penalty": 0.5,
             "n": 1
         }
-
         for attempt in range(max_retries):
             try:
                 response = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
@@ -111,10 +132,8 @@ def translate_text(text, target_language):
                             decoded_line = line.decode('utf-8').strip()
                             if decoded_line == "[DONE]":
                                 continue
-                            # 如果以 "data:" 开头则去掉前缀
                             if decoded_line.startswith("data:"):
                                 decoded_line = decoded_line[5:].strip()
-                            # 如果内容为空或不以 '{' 开头，则跳过
                             if not decoded_line or decoded_line[0] != '{':
                                 logging.warning(f"跳过不符合格式的chunk: {decoded_line}")
                                 continue
@@ -145,15 +164,25 @@ def translate_text(text, target_language):
         logging.error(f"翻译过程中出错: {str(e)}")
         return None
 
-
+def translate_text_in_chunks(text, target_language, delay=0.5):
+    chunks = split_text_into_chunks(text, max_length=1000)
+    translated_chunks = []
+    for i, chunk in enumerate(chunks, 1):
+        time.sleep(delay)
+        translated = translate_text(chunk, target_language)
+        if translated is None:
+            translated_chunks.append("（翻译失败）")
+        else:
+            translated_chunks.append(translated)
+        logging.info(f"第 {i} 块翻译完成，共 {len(chunks)} 块")
+    return "\n".join(translated_chunks)
 
 def pdf_to_images(pdf_path, output_folder):
-    """将PDF文件转换为图片"""
     try:
         images = convert_from_path(
             pdf_path, 
-            dpi=config['ocr_settings']['dpi'] ,
-            poppler_path=config['poppler_config']['path']  # 从配置文件读取路径
+            dpi=config['ocr_settings']['dpi'],
+            poppler_path=config['poppler_config']['path']
         )
     except Exception as e:
         messagebox.showerror("错误", f"PDF转换失败: {str(e)}")
@@ -215,7 +244,6 @@ class ImageProcessorApp:
         # 图片大小选择
         size_frame = ttk.LabelFrame(main_frame, text="图片大小", padding="10")
         size_frame.grid(row=5, column=0, pady=20, sticky=(tk.W, tk.E))
-        
         self.size_var = tk.StringVar(value="2")
         ttk.Radiobutton(size_frame, text="小图 (4英寸宽)", variable=self.size_var, value="1").grid(row=0, column=0, padx=20)
         ttk.Radiobutton(size_frame, text="中等 (6英寸宽)", variable=self.size_var, value="2").grid(row=0, column=1, padx=20)
@@ -231,12 +259,12 @@ class ImageProcessorApp:
         keep_check = ttk.Checkbutton(main_frame, text="保留增强后的图片", variable=self.keep_var)
         keep_check.grid(row=7, column=0, pady=10)
         
-        # 处理按钮
-        self.process_button = ttk.Button(main_frame, text="开始处理", command=self.process_images)
+        # 处理按钮：改为调用 start_processing，点击后按钮隐藏，进度条显示更新
+        self.process_button = ttk.Button(main_frame, text="开始处理", command=self.start_processing)
         self.process_button.grid(row=8, column=0, pady=20)
         
-        # 进度条
-        self.progress = ttk.Progressbar(main_frame, length=400, mode='determinate')
+        # 进度条（设置 maximum 为 100）
+        self.progress = ttk.Progressbar(main_frame, length=400, mode='determinate', maximum=100)
         self.progress.grid(row=9, column=0, pady=10)
         
         # 状态标签（用于显示详细进度信息）
@@ -254,39 +282,62 @@ class ImageProcessorApp:
         file_menu.add_command(label="选择PDF文件", command=self.select_pdf_file)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=root.quit)
+        
+        # 创建一个线程安全的队列用于传递UI更新信息
+        self.ui_queue = queue.Queue()
+        self.poll_ui_queue()
+
+    def poll_ui_queue(self):
+        """定时检查队列，更新UI"""
+        try:
+            while True:
+                message, progress_value = self.ui_queue.get_nowait()
+                self.status_label.config(text=message)
+                if progress_value is not None:
+                    self.progress['value'] = int(progress_value)
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_ui_queue)
+
+    def update_status(self, message, progress_value=None):
+        """将更新任务放入队列，由主线程处理"""
+        self.ui_queue.put((message, progress_value))
 
     def select_pdf_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
         if file_path:
             self.folder_label.config(text=file_path)
-            self.pdf_file = file_path  # 保存为实例属性
+            self.pdf_file = file_path
 
-    def update_status(self, message, progress_value=None):
-        """更新状态标签和进度条，同时刷新界面并写入日志"""
-        self.status_label.config(text=message)
-        if progress_value is not None:
-            self.progress['value'] = progress_value
-        logging.info(message)  # 将状态信息写入日志
-        self.root.update()
+    def start_processing(self):
+        # 隐藏“开始处理”按钮
+        self.process_button.grid_forget()
+        threading.Thread(target=self.process_images, daemon=True).start()
 
     def process_images(self):
         file_path = self.folder_label.cget("text")
         if file_path == "未选择文件":
             messagebox.showerror("错误", "请先选择PDF文件！")
+            self.root.after(0, lambda: self.process_button.grid(row=8, column=0, pady=20))
             return
-
         try:
-            self.update_status("正在转换PDF为图片...", 5)
+            self.update_status("正在转换PDF为图片...", 0)
             temp_folder = os.path.join(os.path.dirname(file_path), "temp_images")
             if not os.path.exists(temp_folder):
                 os.makedirs(temp_folder)
-
             image_files = pdf_to_images(file_path, temp_folder)
             if not image_files:
                 return
-
+            # 计算总步骤数：PDF转换、图片增强、图片重命名、文档创建（每张图片多步骤）、完成状态
+            total_steps = 1
+            if self.enhance_var.get():
+                total_steps += len(image_files)
+            total_steps += len(image_files)
+            total_steps += len(image_files) * 3
+            total_steps += 1
+            step = 1
             total_images = len(image_files)
-            self.update_status(f"共转换出 {total_images} 张图片", 10)
+            self.update_status(f"共转换出 {total_images} 张图片", step / total_steps * 100)
             
             # 如果需要增强图片，逐张处理并更新进度
             enhanced_files = []
@@ -301,35 +352,36 @@ class ImageProcessorApp:
                     enhanced_files.append(enhanced_path)
                     if not self.keep_var.get():
                         os.remove(img_path)
+                    step += 1
+                    # 此处更新的进度值按比例计算，可根据实际情况调整
                     self.update_status(f"增强图片 {i}/{total_images}", 10 + i/total_images*10)
                 image_files = enhanced_files
 
             renamed_files = self.rename_images(temp_folder, image_files)
             if not renamed_files:
                 return
-
-            # 开始创建文档，同时显示处理每张图片的详细进度
-            self.create_image_document(temp_folder)
-
-            # 清理临时文件夹（如果不保留增强后的图片）
+            step += 1
+            self.update_status("开始创建文档...", step / total_steps * 100)
+            self.create_image_document(temp_folder, step, total_steps)
+            step += 1
             if not self.keep_var.get():
                 shutil.rmtree(temp_folder, ignore_errors=True)
-
-            self.update_status("处理完成！", 100)
+            self.update_status("处理完成！", step / total_steps * 100)
+            # 恢复“开始处理”按钮
+            self.root.after(0, lambda: self.process_button.grid(row=8, column=0, pady=20))
             messagebox.showinfo("完成", "文档已生成完成！")
         except Exception as e:
             messagebox.showerror("错误", f"处理过程中出错: {str(e)}")
             logging.error(f"处理过程中出错: {str(e)}")
+            self.root.after(0, lambda: self.process_button.grid(row=8, column=0, pady=20))
 
     def extract_number_from_filename(self, filename):
-        """完全重写的数字提取逻辑"""
         match = re.search(r'_(\d{2})(?:\.|$)', filename)
         if match:
             return int(match.group(1))
         return 9999
 
     def rename_images(self, directory, image_files):
-        """改进的图片重命名函数"""
         self.update_status("正在重命名图片...", 20)
         try:
             renamed_files = []
@@ -345,19 +397,10 @@ class ImageProcessorApp:
             logging.error(f"重命名过程中出错: {str(e)}")
             return None
 
-    def create_image_document(self, input_directory):
-        """改进的文档创建函数，逐张图片显示详细进度，并写入日志，同时插入原文和译文"""
+    def create_image_document(self, input_directory, start_step, total_steps):
         doc = Document()
         image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
-        
-        # 根据选择的图片大小设置宽度（单位英寸）
-        img_width = {
-            '1': 4,
-            '2': 6,
-            '3': 8
-        }[self.size_var.get()]
-        
-        # 获取所有图片文件并排序（按文件名中的“幻灯片 xx”数字排序）
+        img_width = {'1': 4, '2': 6, '3': 8}[self.size_var.get()]
         def get_slide_number(filename):
             match = re.search(r'幻灯片 (\d+)', filename)
             if match:
@@ -365,7 +408,7 @@ class ImageProcessorApp:
             return 9999
         image_files = [f for f in os.listdir(input_directory) if f.lower().endswith(image_extensions)]
         image_files.sort(key=get_slide_number)
-        
+        step = start_step
         total_images = len(image_files)
         self.update_status(f"开始处理 {total_images} 张图片...", 40)
         logging.info(f"共需要处理 {total_images} 张图片")
@@ -373,28 +416,27 @@ class ImageProcessorApp:
         for index, filename in enumerate(image_files, 1):
             image_path = os.path.join(input_directory, filename)
             try:
-                # 插入文件名（不含扩展名）作为段落，并设置背景色（黄色）
                 file_name_without_ext = os.path.splitext(filename)[0]
                 paragraph = doc.add_paragraph(file_name_without_ext)
                 paragraph._p.get_or_add_pPr().append(
                     parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFC000"/>')
                 )
-                
-                # 插入图片
+                step += 1
+                self.update_status(f"插入文件名 {index}/{total_images}", step / total_steps * 100)
                 doc.add_picture(image_path, width=Inches(img_width))
-                
-                # 调用 OCR 识别获取原文
-                self.update_status(f"图片 {index}/{total_images}: 正在进行OCR识别...", 50 + index/total_images*10)
+                step += 1
+                self.update_status(f"插入图片 {index}/{total_images}", step / total_steps * 100)
+                self.update_status(f"图片 {index}/{total_images}: 正在进行OCR识别...", step / total_steps * 100)
                 logging.info(f"图片 {index}/{total_images}: 开始OCR识别 {filename}")
                 original_text = ocr_text(image_path)
-                
-                # 调用翻译函数获取译文
+                step += 1
+                self.update_status(f"OCR识别完成 {index}/{total_images}", step / total_steps * 100)
                 if original_text:
-                    # 为避免429错误，在发起翻译请求前等待10秒
-                    time.sleep(10)
-                    self.update_status(f"图片 {index}/{total_images}: 正在翻译...", 60 + index/total_images*10)
+                    self.update_status(f"图片 {index}/{total_images}: 正在翻译...", step / total_steps * 100)
                     logging.info(f"图片 {index}/{total_images}: 开始翻译 {filename}")
-                    translated_text = translate_text(original_text, self.language_var.get())
+                    translated_text = translate_text_in_chunks(original_text, self.language_var.get())
+                    step += 1
+                    self.update_status(f"翻译完成 {index}/{total_images}", step / total_steps * 100)
                     if translated_text:
                         doc.add_paragraph(f"原文: {original_text}")
                         doc.add_paragraph(f"翻译: {translated_text}")
@@ -404,19 +446,16 @@ class ImageProcessorApp:
                 else:
                     doc.add_paragraph("原文: （无识别内容）")
                     doc.add_paragraph("翻译: （无识别内容）")
-                
-                # 添加空行进行分隔
+                    step += 1
+                    self.update_status(f"处理无识别内容 {index}/{total_images}", step / total_steps * 100)
                 doc.add_paragraph()
-                
-                progress = 40 + (index / total_images * 50)
-                self.update_status(f"正在处理: {index}/{total_images}", progress)
+                step += 1
+                self.update_status(f"处理完成 {index}/{total_images}", step / total_steps * 100)
                 logging.info(f"图片 {index}/{total_images}: 处理完成 {filename}")
-                
             except Exception as e:
                 messagebox.showerror("错误", f"处理图片 {filename} 时出错: {str(e)}")
                 logging.error(f"处理图片 {filename} 时出错: {str(e)}")
                 return
-        
         output_file = os.path.join(
             os.path.dirname(input_directory),
             f"{os.path.basename(self.pdf_file)}_转换结果.docx"
@@ -424,10 +463,11 @@ class ImageProcessorApp:
         doc.save(output_file)
         logging.info(f"文档已保存到: {output_file}")
 
-
 def main():
     root = tk.Tk()
     app = ImageProcessorApp(root)
+    if sys.platform == 'darwin':
+        root.createcommand('tk::mac::ReopenApplication', root.lift)
     try:
         root.mainloop()
     finally:
